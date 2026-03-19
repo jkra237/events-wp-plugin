@@ -1,0 +1,896 @@
+<?php
+defined('ABSPATH') || exit;
+
+add_action('admin_menu',            'sbe_add_admin_menu');
+add_action('admin_enqueue_scripts', 'sbe_admin_assets');
+
+function sbe_add_admin_menu(): void {
+    add_menu_page('Spielbank Events','Spielbank Events','manage_options',
+        'spielbank-events','sbe_render_admin_page','dashicons-calendar-alt',30);
+}
+
+function sbe_admin_assets(string $hook): void {
+    if ($hook !== 'toplevel_page_spielbank-events') return;
+    wp_enqueue_style ('sbe-admin',   SBE_PLUGIN_URL.'admin/admin.css',   [], SBE_VERSION);
+    wp_enqueue_script('sbe-admin',   SBE_PLUGIN_URL.'admin/admin.js',    ['jquery'], SBE_VERSION, true);
+    wp_localize_script('sbe-admin','SBE',[
+        'ajax_url' => admin_url('admin-ajax.php'),
+        'nonce'    => wp_create_nonce('sbe_nonce'),
+    ]);
+}
+
+function sbe_render_admin_page(): void {
+    $events    = sbe_get_all_events();
+    $locations = sbe_get_all_locations();
+    $sources   = sbe_get_all_sources();
+    $settings  = sbe_get_settings();
+    $ecounts   = array_count_values(array_column($events,'status'));
+    $tab       = sanitize_text_field($_GET['sbe_tab'] ?? 'sources');
+    ?>
+    <div class="wrap sbe-wrap">
+
+      <h1 class="sbe-page-title">
+        <span class="dashicons dashicons-calendar-alt"></span> Spielbank Events
+        <span class="sbe-shortcode-hint">
+          Shortcode: <code>[spielbank_events]</code>
+        </span>
+      </h1>
+
+      <!-- STATS -->
+      <div class="sbe-stats">
+        <div class="sbe-stat">
+          <strong><?= count($events) ?></strong><span>Events gesamt</span>
+        </div>
+        <div class="sbe-stat sbe-stat--scraped">
+          <strong><?= $ecounts['scraped']??0 ?></strong><span>Neu gescrapt</span>
+        </div>
+        <div class="sbe-stat sbe-stat--approved">
+          <strong><?= $ecounts['approved']??0 ?></strong><span>Genehmigt</span>
+        </div>
+        <div class="sbe-stat sbe-stat--published">
+          <strong><?= $ecounts['published']??0 ?></strong><span>Veröffentlicht</span>
+        </div>
+        <div class="sbe-stat sbe-stat--locs">
+          <strong><?= count($locations) ?></strong><span>Standorte</span>
+        </div>
+        <div class="sbe-stat sbe-stat--sources">
+          <strong><?= count($sources) ?></strong><span>Quellen</span>
+        </div>
+      </div>
+
+      <!-- TOOLBAR -->
+      <div class="sbe-toolbar">
+        <button id="sbe-btn-scrape" class="button button-primary sbe-btn-scrape">
+          <span class="dashicons dashicons-update"></span> Jetzt scrapen
+        </button>
+        <button id="sbe-btn-approve-all" class="button sbe-btn-approve">
+          <span class="dashicons dashicons-yes-alt"></span> Alle genehmigen
+        </button>
+        <button id="sbe-btn-publish" class="button sbe-btn-publish">
+          <span class="dashicons dashicons-upload"></span> Auf /events/ veröffentlichen
+        </button>
+      </div>
+
+      <!-- LOG + PROGRESS + NOTICE -->
+      <div id="sbe-progress-wrap" class="sbe-progress-wrap" style="display:none">
+        <div class="sbe-progress-info">
+          <span id="sbe-progress-label">Starte Scraper…</span>
+          <span id="sbe-progress-pct">0%</span>
+        </div>
+        <div class="sbe-progress-bar">
+          <div id="sbe-progress-fill" class="sbe-progress-fill" style="width:0%"></div>
+        </div>
+      </div>
+      <div id="sbe-log" class="sbe-log" style="display:none">
+        <div class="sbe-log-header">
+          <strong>Scraper-Log</strong>
+          <button class="sbe-log-close" onclick="document.getElementById('sbe-log').style.display='none'">✕</button>
+        </div>
+        <pre id="sbe-log-content"></pre>
+      </div>
+      <div id="sbe-notice" class="sbe-notice" style="display:none"></div>
+
+      <!-- TABS -->
+      <div class="sbe-tabs-nav">
+        <button class="sbe-tab-btn <?= $tab==='sources'?'active':'' ?>" data-tab="sources" id="sbe-tab-btn-sources">
+          <span class="dashicons dashicons-admin-site-alt3"></span> Spielbank Quellen (<span class="sbe-tab-count-sources"><?= count($sources) ?></span>)
+        </button>
+        <button class="sbe-tab-btn <?= $tab==='events'?'active':'' ?>" data-tab="events" id="sbe-tab-btn-events">
+          <span class="dashicons dashicons-calendar-alt"></span> Events (<span class="sbe-tab-count-events"><?= count($events) ?></span>)
+        </button>
+        <button class="sbe-tab-btn <?= $tab==='locations'?'active':'' ?>" data-tab="locations">
+          <span class="dashicons dashicons-location"></span> Standorte &amp; Öffnungszeiten (<?= count($locations) ?>)
+        </button>
+        <button class="sbe-tab-btn <?= $tab==='external'?'active':'' ?>" data-tab="external">
+          <span class="dashicons dashicons-tickets-alt"></span> Externe Events
+        </button>
+        <button class="sbe-tab-btn <?= $tab==='ai'?'active':'' ?>" data-tab="ai">
+          <span class="dashicons dashicons-superhero"></span> AI Assistent
+        </button>
+        <button class="sbe-tab-btn <?= $tab==='settings'?'active':'' ?>" data-tab="settings">
+          <span class="dashicons dashicons-admin-generic"></span> Settings
+        </button>
+      </div>
+
+      <!-- ══ TAB: SOURCES ══ -->
+      <div id="sbe-tab-sources" class="sbe-tab-panel" <?= $tab!=='sources'?'style="display:none"':'' ?>>
+        <div class="sbe-toolbar sbe-toolbar--sub">
+          <button id="sbe-btn-add-source" class="button sbe-btn-add">
+            <span class="dashicons dashicons-plus-alt"></span> Quelle hinzufügen
+          </button>
+        </div>
+
+        <div class="sbe-table-wrap">
+          <table class="sbe-table" id="sbe-source-table">
+            <thead><tr>
+              <th>Name</th>
+              <th>Base-URL</th>
+              <th style="width:90px">Events-URLs</th>
+              <th style="width:70px">Aktiv</th>
+              <th style="width:110px">Letzter Scrape</th>
+              <th style="width:60px">Events</th>
+              <th style="width:90px">Status</th>
+              <th style="width:150px">Aktionen</th>
+            </tr></thead>
+            <tbody id="sbe-source-tbody">
+              <?php foreach($sources as $s): echo sbe_render_source_row($s); endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ══ TAB: EVENTS ══ -->
+      <div id="sbe-tab-events" class="sbe-tab-panel" <?= $tab!=='events'?'style="display:none"':'' ?>>
+        <div class="sbe-toolbar sbe-toolbar--sub">
+          <button id="sbe-btn-add-event" class="button sbe-btn-add">
+            <span class="dashicons dashicons-plus-alt"></span> Event hinzufügen
+          </button>
+          <select id="sbe-filter-status">
+            <option value="">Alle Status</option>
+            <option value="scraped">Gescrapt</option>
+            <option value="approved">Genehmigt</option>
+            <option value="published">Veröffentlicht</option>
+            <option value="draft">Entwurf</option>
+          </select>
+          <select id="sbe-filter-type">
+            <option value="">Alle Typen</option>
+            <option>Poker</option><option>Blackjack</option><option>Roulette</option>
+            <option>Slots</option><option>Musik</option><option>Sonstige</option>
+          </select>
+          <input type="text" id="sbe-filter-search" placeholder="Suchen…" />
+        </div>
+
+        <div class="sbe-table-wrap">
+          <table class="sbe-table" id="sbe-table">
+            <thead><tr>
+              <th style="width:40px"><input type="checkbox" id="sbe-check-all" title="Alle auswählen"/></th>
+              <th>Event-Name</th>
+              <th style="width:120px">Datum</th>
+              <th style="width:100px">Ort</th>
+              <th style="width:85px" >Typ</th>
+              <th style="width:85px" >Quelle</th>
+              <th style="width:75px" >Schema%</th>
+              <th style="width:90px" >Status</th>
+              <th style="width:130px">Aktionen</th>
+            </tr></thead>
+            <tbody id="sbe-tbody">
+              <?php foreach($events as $ev): echo sbe_render_event_row($ev); endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="sbe-batch-bar" id="sbe-batch-bar" style="display:none">
+          <span id="sbe-batch-count">0 ausgewählt</span>
+          <button class="button" id="sbe-batch-approve">Genehmigen</button>
+          <button class="button" id="sbe-batch-publish">Veröffentlichen</button>
+          <button class="button sbe-btn-danger" id="sbe-batch-delete">Löschen</button>
+        </div>
+      </div>
+
+      <!-- ══ TAB: LOCATIONS ══ -->
+      <div id="sbe-tab-locations" class="sbe-tab-panel" <?= $tab==='locations'?'':'style="display:none"' ?>>
+        <div class="sbe-toolbar sbe-toolbar--sub">
+          <button id="sbe-btn-add-location" class="button sbe-btn-add">
+            <span class="dashicons dashicons-plus-alt"></span> Standort hinzufügen
+          </button>
+        </div>
+
+        <div class="sbe-schema-legend">
+          <strong>Schema-Typen in dieser Tabelle:</strong>
+          <span class="sbe-schema-badge">LocalBusiness</span>
+          <span class="sbe-schema-badge sbe-schema-badge--gambling">GamblingResort</span>
+          <span class="sbe-schema-badge sbe-schema-badge--hours">OpeningHoursSpecification</span>
+        </div>
+
+        <div class="sbe-table-wrap">
+          <table class="sbe-table">
+            <thead><tr>
+              <th>Name</th>
+              <th style="width:100px">Stadt</th>
+              <th style="width:70px" >PLZ</th>
+              <th style="width:90px" >Telefon</th>
+              <th style="width:60px" >Rating</th>
+              <th style="width:60px" >Preis</th>
+              <th style="width:70px" >Öffnungszeiten</th>
+              <th style="width:80px">Status</th>
+              <th style="width:130px">Aktionen</th>
+            </tr></thead>
+            <tbody id="sbe-loc-tbody">
+              <?php foreach($locations as $loc): echo sbe_render_location_row($loc); endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ══ TAB: EXTERNAL EVENTS ══ -->
+      <div id="sbe-tab-external" class="sbe-tab-panel" <?= $tab==='external'?'':'style="display:none"' ?>>
+        <div class="sbe-toolbar sbe-toolbar--sub">
+          <input type="text" id="sbe-ext-query" placeholder="Suchbegriff z.B. Spielbank Berlin" style="width:280px" />
+          <button id="sbe-btn-ext-search" class="button button-primary">
+            <span class="dashicons dashicons-search"></span> Eventim / Eventbrite / Reservix durchsuchen
+          </button>
+        </div>
+
+        <div id="sbe-ext-progress" class="sbe-ext-progress" style="display:none">
+          <span id="sbe-ext-progress-label">Suche läuft…</span>
+        </div>
+
+        <div id="sbe-ext-log" style="display:none" class="sbe-ext-log"></div>
+
+        <div class="sbe-table-wrap">
+          <table class="sbe-table" id="sbe-ext-table" style="display:none">
+            <thead><tr>
+              <th style="width:40px"><input type="checkbox" id="sbe-ext-check-all" title="Alle auswählen"/></th>
+              <th>Event-Name</th>
+              <th style="width:120px">Datum</th>
+              <th style="width:120px">Ort</th>
+              <th style="width:70px">Preis</th>
+              <th style="width:90px">Quelle</th>
+              <th style="width:70px">Typ</th>
+              <th style="width:100px">Aktionen</th>
+            </tr></thead>
+            <tbody id="sbe-ext-tbody"></tbody>
+          </table>
+        </div>
+
+        <div id="sbe-ext-batch" class="sbe-batch-bar" style="display:none">
+          <span id="sbe-ext-batch-count">0 ausgewählt</span>
+          <button class="button" id="sbe-ext-import-selected">Ausgewählte importieren</button>
+        </div>
+
+        <div id="sbe-ext-empty" class="sbe-ext-empty" style="display:none">
+          <p>Keine externen Events gefunden. Versuche einen anderen Suchbegriff.</p>
+        </div>
+      </div>
+
+      <!-- ══ TAB: AI ASSISTENT ══ -->
+      <div id="sbe-tab-ai" class="sbe-tab-panel" <?= $tab==='ai'?'':'style="display:none"' ?>>
+        <div class="sbe-ai-wrap">
+
+          <div class="sbe-ai-section">
+            <h2>📤 CSV Export – Unvollständige Events</h2>
+            <p class="description">Exportiert alle Events, bei denen Schema-Felder fehlen. Du kannst die CSV-Datei in Claude, ChatGPT oder Gemini hochladen und die AI bitten, die leeren Felder zu recherchieren und auszufüllen.</p>
+
+            <div class="sbe-ai-options">
+              <label>Nur Events mit Schema-Vollständigkeit unter:
+                <select id="sbe-ai-threshold">
+                  <option value="100">100% (alle unvollständigen)</option>
+                  <option value="80" selected>80%</option>
+                  <option value="60">60%</option>
+                  <option value="40">40%</option>
+                </select>
+              </label>
+              <label>Status:
+                <select id="sbe-ai-status">
+                  <option value="">Alle</option>
+                  <option value="scraped">Gescrapt</option>
+                  <option value="approved">Genehmigt</option>
+                  <option value="published">Veröffentlicht</option>
+                  <option value="draft">Entwurf</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="sbe-ai-export-info" id="sbe-ai-export-info"></div>
+
+            <p>
+              <button id="sbe-ai-export-btn" class="button button-primary">
+                <span class="dashicons dashicons-download"></span> CSV exportieren
+              </button>
+              <button id="sbe-ai-copy-prompt" class="button" style="margin-left:8px">
+                <span class="dashicons dashicons-clipboard"></span> AI-Prompt kopieren
+              </button>
+            </p>
+          </div>
+
+          <hr style="margin:24px 0;border:none;border-top:1px solid #e0e0e0"/>
+
+          <div class="sbe-ai-section">
+            <h2>📥 CSV Import – AI-Ergebnisse einlesen</h2>
+            <p class="description">Lade die von der AI ausgefüllte CSV-Datei hoch. Nur leere Felder werden befüllt – vorhandene Daten werden <strong>nicht überschrieben</strong>.</p>
+
+            <div class="sbe-ai-upload">
+              <input type="file" id="sbe-ai-import-file" accept=".csv" />
+              <button id="sbe-ai-import-btn" class="button button-primary" disabled>
+                <span class="dashicons dashicons-upload"></span> CSV importieren
+              </button>
+            </div>
+
+            <div id="sbe-ai-import-preview" class="sbe-ai-import-preview" style="display:none"></div>
+            <div id="sbe-ai-import-result" class="sbe-ai-import-result" style="display:none"></div>
+          </div>
+
+          <hr style="margin:24px 0;border:none;border-top:1px solid #e0e0e0"/>
+
+          <div class="sbe-ai-section sbe-ai-howto">
+            <h2>💡 So geht's</h2>
+            <ol>
+              <li><strong>Exportieren</strong> – Klicke auf „CSV exportieren". Es werden nur Events mit fehlenden Daten exportiert.</li>
+              <li><strong>AI fragen</strong> – Lade die CSV bei <a href="https://claude.ai" target="_blank">Claude</a>, <a href="https://gemini.google.com" target="_blank">Gemini</a> oder <a href="https://chatgpt.com" target="_blank">ChatGPT</a> hoch mit dem Prompt: <em>„Fülle die leeren Felder in dieser CSV aus. Recherchiere die Events online und ergänze description, start_date, end_date, image_url, ticket_url, price. Gib die vollständige CSV zurück."</em></li>
+              <li><strong>Importieren</strong> – Lade die ausgefüllte CSV hier hoch. Nur leere Felder werden ergänzt.</li>
+            </ol>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- ══ TAB: SETTINGS ══ -->
+      <div id="sbe-tab-settings" class="sbe-tab-panel" <?= $tab==='settings'?'':'style="display:none"' ?>>
+        <div class="sbe-settings-wrap">
+          <h2>Scraper-Einstellungen</h2>
+          <p class="description">Globale Einstellungen, die für alle Quellen gelten (sofern nicht pro Quelle überschrieben).</p>
+
+          <table class="form-table sbe-settings-table">
+            <tr>
+              <th>User-Agent</th>
+              <td><input type="text" id="sbe-set-useragent" class="large-text" value="<?= esc_attr($settings['user_agent']) ?>" />
+              <p class="description">HTTP User-Agent Header für Scraping-Requests.</p></td>
+            </tr>
+            <tr>
+              <th>Request Timeout (Sek.)</th>
+              <td><input type="number" id="sbe-set-timeout" min="5" max="60" value="<?= (int)$settings['request_timeout'] ?>" class="small-text" /></td>
+            </tr>
+            <tr>
+              <th>Verzögerung zwischen Requests (Sek.)</th>
+              <td><input type="number" id="sbe-set-delay" min="0" max="30" value="<?= (int)$settings['request_delay'] ?>" class="small-text" />
+              <p class="description">Polite Delay – Wartezeit zwischen HTTP-Requests an dieselbe Domain.</p></td>
+            </tr>
+            <tr>
+              <th>Max. Events pro Quelle</th>
+              <td><input type="number" id="sbe-set-maxevents" min="1" max="200" value="<?= (int)$settings['max_events'] ?>" class="small-text" /></td>
+            </tr>
+            <tr>
+              <th>Retry-Versuche</th>
+              <td><input type="number" id="sbe-set-retries" min="0" max="5" value="<?= (int)$settings['retry_count'] ?>" class="small-text" />
+              <p class="description">Wie oft ein fehlgeschlagener Request wiederholt wird.</p></td>
+            </tr>
+            <tr>
+              <th>Retry-Verzögerung (Sek.)</th>
+              <td><input type="number" id="sbe-set-retrydelay" min="1" max="30" value="<?= (int)$settings['retry_delay'] ?>" class="small-text" /></td>
+            </tr>
+            <tr>
+              <th>Accept-Language</th>
+              <td><input type="text" id="sbe-set-lang" class="regular-text" value="<?= esc_attr($settings['accept_language']) ?>" /></td>
+            </tr>
+            <tr>
+              <th>Redirects folgen</th>
+              <td><label><input type="checkbox" id="sbe-set-redirects" value="1" <?= $settings['follow_redirects'] ? 'checked' : '' ?> /> HTTP-Weiterleitungen automatisch folgen</label></td>
+            </tr>
+            <tr>
+              <th>Sitemap prüfen</th>
+              <td><label><input type="checkbox" id="sbe-set-sitemap" value="1" <?= $settings['check_sitemap'] ? 'checked' : '' ?> /> Sitemap.xml auf Event-URLs durchsuchen</label></td>
+            </tr>
+            <tr>
+              <th>Duplikat-Fenster (Tage)</th>
+              <td><input type="number" id="sbe-set-dedup" min="1" max="365" value="<?= (int)$settings['dedup_window'] ?>" class="small-text" />
+              <p class="description">Zeitraum in Tagen, in dem Events als Duplikate erkannt werden.</p></td>
+            </tr>
+            <tr>
+              <th>Crawl Depth</th>
+              <td><select id="sbe-set-depth">
+                <option value="0" <?= (int)($settings['crawl_depth'] ?? 1) === 0 ? 'selected' : '' ?>>0 – Nur Listensciten (keine Detail-Seiten)</option>
+                <option value="1" <?= (int)($settings['crawl_depth'] ?? 1) === 1 ? 'selected' : '' ?>>1 – Event-Detail-Seiten folgen (empfohlen)</option>
+                <option value="2" <?= (int)($settings['crawl_depth'] ?? 1) === 2 ? 'selected' : '' ?>>2 – Detail-Seiten + dort verlinkte Seiten</option>
+              </select>
+              <p class="description">Wie tief der Scraper Links folgt, um Event-Daten anzureichern. Höhere Tiefe = mehr Daten, aber langsamere Scrapes und mehr Requests.</p></td>
+            </tr>
+            <tr>
+              <th>Blacklist-Muster</th>
+              <td><textarea id="sbe-set-blacklist" rows="5" class="large-text" placeholder="newsletter&#10;abonnieren&#10;cookie"><?= esc_textarea($settings['blacklist_patterns'] ?? '') ?></textarea>
+              <p class="description">Zusätzliche Muster zum Filtern (ein Muster pro Zeile, Regex erlaubt). Events mit diesen Begriffen in Name oder Beschreibung werden übersprungen.<br>
+              <strong>Fest eingebaut:</strong> newsletter, abonnieren, subscribe, sign up, cookie, datenschutz, impressum, agb, stellenangebot, karriere</p></td>
+            </tr>
+          </table>
+
+          <p><button id="sbe-btn-save-settings" class="button button-primary">Einstellungen speichern</button></p>
+        </div>
+      </div>
+
+    </div><!-- /wrap -->
+
+    <!-- ══ MODAL: Source ══ -->
+    <div id="sbe-modal-source" class="sbe-modal" style="display:none">
+      <div class="sbe-modal-inner sbe-modal-inner--wide">
+        <div class="sbe-modal-header">
+          <h2 id="sbe-modal-source-title">Quelle bearbeiten</h2>
+          <button class="sbe-modal-close" onclick="sbeCloseModal('source')">✕</button>
+        </div>
+
+        <!-- ── WIZARD: Step 1 – Just enter the URL ── -->
+        <div id="sbe-wizard-step1" class="sbe-wizard-step" style="display:none">
+          <div class="sbe-wizard-hero">
+            <span class="dashicons dashicons-admin-site-alt3" style="font-size:48px;color:#0073aa;display:block;margin-bottom:12px"></span>
+            <h3>Spielbank-Website hinzufügen</h3>
+            <p class="description">Gib einfach die Website-Adresse ein – wir finden den Rest automatisch.</p>
+          </div>
+          <div class="sbe-wizard-url-input">
+            <input type="url" id="sbe-wizard-url" placeholder="https://www.spielbank-beispiel.de" class="large-text" autofocus />
+            <button type="button" id="sbe-wizard-scan-btn" class="button button-primary button-hero">
+              <span class="dashicons dashicons-search"></span> Website scannen
+            </button>
+          </div>
+          <p class="sbe-wizard-hint">Das Plugin prüft robots.txt, Sitemap, Navigation und JSON-LD der Seite automatisch.</p>
+        </div>
+
+        <!-- ── WIZARD: Step 2 – Scan results ── -->
+        <div id="sbe-wizard-step2" class="sbe-wizard-step" style="display:none">
+          <div class="sbe-wizard-scan-header">
+            <h3 id="sbe-wizard-found-name">Scan-Ergebnisse</h3>
+            <span id="sbe-wizard-found-url" class="sbe-wizard-found-url"></span>
+          </div>
+
+          <!-- Scan progress -->
+          <div id="sbe-wizard-progress" class="sbe-wizard-progress">
+            <div class="sbe-wizard-progress-steps">
+              <div class="sbe-wiz-pstep" data-step="robots"><span class="sbe-wiz-pstep-icon">⏳</span> robots.txt</div>
+              <div class="sbe-wiz-pstep" data-step="sitemap"><span class="sbe-wiz-pstep-icon">⏳</span> Sitemap</div>
+              <div class="sbe-wiz-pstep" data-step="homepage"><span class="sbe-wiz-pstep-icon">⏳</span> Homepage</div>
+              <div class="sbe-wiz-pstep" data-step="bruteforce"><span class="sbe-wiz-pstep-icon">⏳</span> Unterseiten</div>
+            </div>
+          </div>
+
+          <!-- Results cards -->
+          <div id="sbe-wizard-results" class="sbe-wizard-results" style="display:none">
+
+            <!-- Business info card -->
+            <div class="sbe-wiz-card" id="sbe-wiz-card-business">
+              <div class="sbe-wiz-card-header">
+                <span class="dashicons dashicons-building"></span>
+                <strong>Erkannte Business-Daten</strong>
+                <span class="sbe-wiz-card-badge" id="sbe-wiz-seed-badge">–</span>
+              </div>
+              <div class="sbe-wiz-card-body" id="sbe-wiz-seed-preview"></div>
+            </div>
+
+            <!-- Events URLs card -->
+            <div class="sbe-wiz-card" id="sbe-wiz-card-events">
+              <div class="sbe-wiz-card-header">
+                <span class="dashicons dashicons-calendar-alt"></span>
+                <strong>Gefundene Event-Seiten</strong>
+                <span class="sbe-wiz-card-badge" id="sbe-wiz-events-badge">0</span>
+              </div>
+              <div class="sbe-wiz-card-body" id="sbe-wiz-events-list">
+                <p class="sbe-wiz-empty">Keine Event-Seiten gefunden.</p>
+              </div>
+            </div>
+
+            <!-- Contact URL card -->
+            <div class="sbe-wiz-card" id="sbe-wiz-card-contact">
+              <div class="sbe-wiz-card-header">
+                <span class="dashicons dashicons-phone"></span>
+                <strong>Kontaktseite</strong>
+              </div>
+              <div class="sbe-wiz-card-body" id="sbe-wiz-contact-preview"></div>
+            </div>
+
+            <!-- Technical URLs card -->
+            <div class="sbe-wiz-card" id="sbe-wiz-card-technical">
+              <div class="sbe-wiz-card-header">
+                <span class="dashicons dashicons-admin-tools"></span>
+                <strong>Technische URLs</strong>
+              </div>
+              <div class="sbe-wiz-card-body" id="sbe-wiz-technical-preview"></div>
+            </div>
+
+          </div>
+
+          <!-- Scan log (collapsible) -->
+          <details class="sbe-wizard-log-details" id="sbe-wizard-log-details">
+            <summary>Scan-Log anzeigen</summary>
+            <pre id="sbe-wizard-scan-log"></pre>
+          </details>
+
+          <div class="sbe-wizard-step2-actions">
+            <button type="button" class="button" id="sbe-wizard-back-btn">← Zurück</button>
+            <button type="button" class="button" id="sbe-wizard-advanced-btn">⚙️ Erweiterte Einstellungen</button>
+            <button type="button" class="button button-primary" id="sbe-wizard-save-btn">
+              <span class="dashicons dashicons-saved"></span> Quelle speichern
+            </button>
+          </div>
+        </div>
+
+        <!-- ── Advanced / Edit mode (original form, shown for edit or on demand) ── -->
+        <div id="sbe-source-advanced" style="display:none">
+          <div class="sbe-modal-body sbe-modal-body--2col">
+            <input type="hidden" id="sbe-sf-id"/>
+
+            <div class="sbe-form-section sbe-form-section--span"><h3>🌐 Basis-URLs</h3></div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Name *</label>
+              <input type="text" id="sbe-sf-name" placeholder="z.B. spielbank-berlin.de"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Base-URL *</label>
+              <div class="sbe-input-with-btn">
+                <input type="url" id="sbe-sf-baseurl" placeholder="https://www.spielbank-berlin.de"/>
+                <button type="button" class="button button-small" id="sbe-btn-autodiscover" title="Unterseiten automatisch erkennen">🔎 Auto-Erkennung</button>
+              </div>
+            </div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Events-URLs <small>(eine URL pro Zeile)</small></label>
+              <textarea id="sbe-sf-eventsurl" rows="3" placeholder="https://…/veranstaltungen/&#10;https://…/events/&#10;https://…/news/"></textarea>
+            </div>
+            <div class="sbe-form-row">
+              <label>Kontakt-URL</label>
+              <input type="url" id="sbe-sf-contacturl" placeholder="https://…/kontakt/"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>robots.txt URL</label>
+              <input type="url" id="sbe-sf-robotsurl" placeholder="https://…/robots.txt"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Sitemap-URL</label>
+              <input type="url" id="sbe-sf-sitemapurl" placeholder="https://…/sitemap.xml"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Aktiv</label>
+              <select id="sbe-sf-active">
+                <option value="1">Ja</option><option value="0">Nein</option>
+              </select>
+            </div>
+
+            <div class="sbe-form-section sbe-form-section--span"><h3>⚙️ Quell-spezifische Settings <small>(überschreiben globale Settings)</small></h3></div>
+            <div class="sbe-form-row">
+              <label>Custom User-Agent</label>
+              <input type="text" id="sbe-sf-useragent" placeholder="Leer = Global verwenden"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Timeout (Sek.)</label>
+              <input type="number" id="sbe-sf-timeout" min="0" placeholder="0 = Global"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Request-Delay (Sek.)</label>
+              <input type="number" id="sbe-sf-delay" min="0" placeholder="0 = Global"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Max. Seiten</label>
+              <input type="number" id="sbe-sf-maxpages" min="1" value="1"/>
+            </div>
+            <div class="sbe-form-row">
+              <label>Pagination folgen</label>
+              <select id="sbe-sf-pagination">
+                <option value="0">Nein</option><option value="1">Ja</option>
+              </select>
+            </div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Pagination XPath-Selektor</label>
+              <input type="text" id="sbe-sf-pagsel" placeholder='z.B. //a[@rel="next"]'/>
+            </div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Custom Event-Selektoren (XPath, je Zeile ein Selektor)</label>
+              <textarea id="sbe-sf-eventsel" rows="3" placeholder='z.B. //div[contains(@class,"event-card")]'></textarea>
+            </div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Custom HTTP-Headers (JSON)</label>
+              <textarea id="sbe-sf-headers" rows="2" placeholder='{"X-Custom":"value"}'></textarea>
+            </div>
+
+            <div class="sbe-form-section sbe-form-section--span"><h3>🌱 Seed-Daten <small>(Fallback wenn Scraping nichts liefert)</small></h3></div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Seed Location Data (JSON)</label>
+              <textarea id="sbe-sf-seed" rows="6" placeholder='{"name":"Spielbank …","telephone":"…","street_address":"…"}'></textarea>
+            </div>
+            <div class="sbe-form-row sbe-form-row--full">
+              <label>Seed Öffnungszeiten (JSON Array)</label>
+              <textarea id="sbe-sf-seedhours" rows="3" placeholder='[["Monday","11:00","03:00"],["Tuesday","11:00","03:00"]]'></textarea>
+            </div>
+          </div>
+          <div class="sbe-modal-footer">
+            <button class="button" id="sbe-btn-test-source" style="margin-right:auto">🔍 URL testen</button>
+            <button class="button" onclick="sbeCloseModal('source')">Abbrechen</button>
+            <button class="button button-primary" onclick="sbeSaveSourceModal()">Quelle speichern</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ══ MODAL: Event ══ -->
+    <div id="sbe-modal-event" class="sbe-modal" style="display:none">
+      <div class="sbe-modal-inner sbe-modal-inner--wide">
+        <div class="sbe-modal-header">
+          <h2 id="sbe-modal-event-title">Event bearbeiten</h2>
+          <button class="sbe-modal-close" onclick="sbeCloseModal('event')">✕</button>
+        </div>
+        <div class="sbe-modal-body">
+          <input type="hidden" id="sbe-ef-id"/>
+          <div class="sbe-form-section"><h3>Event-Schema <span class="sbe-schema-badge sbe-schema-badge--event">schema.org/Event</span></h3></div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Name *</label>
+            <input type="text" id="sbe-ef-name"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Start-Datum &amp; Zeit</label>
+            <input type="datetime-local" id="sbe-ef-start"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>End-Datum &amp; Zeit</label>
+            <input type="datetime-local" id="sbe-ef-end"/>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Beschreibung</label>
+            <textarea id="sbe-ef-desc" rows="3"></textarea>
+          </div>
+          <div class="sbe-form-row">
+            <label>Veranstaltungsort (Place)</label>
+            <input type="text" id="sbe-ef-location"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Stadt</label>
+            <input type="text" id="sbe-ef-city"/>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Adresse</label>
+            <input type="text" id="sbe-ef-address"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Veranstalter (Organizer)</label>
+            <input type="text" id="sbe-ef-organizer"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Event-Typ</label>
+            <select id="sbe-ef-type">
+              <option>Poker</option><option>Blackjack</option><option>Roulette</option>
+              <option>Slots</option><option>Musik</option><option>Sonstige</option>
+            </select>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>URL</label>
+            <input type="url" id="sbe-ef-url"/>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Bild-URL</label>
+            <input type="url" id="sbe-ef-image"/>
+          </div>
+          <div class="sbe-form-section"><h3>Offer – Tickets &amp; Preis <span class="sbe-schema-badge sbe-schema-badge--offer">schema.org/Offer</span></h3></div>
+          <div class="sbe-form-row">
+            <label>Ticket-URL</label>
+            <input type="url" id="sbe-ef-ticket"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Preis</label>
+            <input type="text" id="sbe-ef-price" placeholder="z.B. 15"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Währung</label>
+            <input type="text" id="sbe-ef-currency" value="EUR"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Status</label>
+            <select id="sbe-ef-status">
+              <option value="draft">Entwurf</option>
+              <option value="scraped">Gescrapt</option>
+              <option value="approved">Genehmigt</option>
+              <option value="published">Veröffentlicht</option>
+            </select>
+          </div>
+        </div>
+        <div class="sbe-modal-footer">
+          <button class="button" onclick="sbeCloseModal('event')">Abbrechen</button>
+          <button class="button button-primary" onclick="sbeSaveEventModal()">Speichern</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ MODAL: Location ══ -->
+    <div id="sbe-modal-location" class="sbe-modal" style="display:none">
+      <div class="sbe-modal-inner sbe-modal-inner--wide">
+        <div class="sbe-modal-header">
+          <h2 id="sbe-modal-loc-title">Standort bearbeiten</h2>
+          <button class="sbe-modal-close" onclick="sbeCloseModal('location')">✕</button>
+        </div>
+        <div class="sbe-modal-body sbe-modal-body--3col">
+          <input type="hidden" id="sbe-lf-id"/>
+          <div class="sbe-form-section sbe-form-section--span">
+            <h3>🏢 LocalBusiness / GamblingResort
+              <span class="sbe-schema-badge" style="margin-left:6px">LocalBusiness</span>
+              <span class="sbe-schema-badge sbe-schema-badge--gambling">GamblingResort</span>
+            </h3>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Name *</label>
+            <input type="text" id="sbe-lf-name"/>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Alternativer Name</label>
+            <input type="text" id="sbe-lf-altname"/>
+          </div>
+          <div class="sbe-form-row sbe-form-row--full">
+            <label>Beschreibung</label>
+            <textarea id="sbe-lf-desc" rows="3"></textarea>
+          </div>
+          <div class="sbe-form-row">
+            <label>Website-URL</label>
+            <input type="url" id="sbe-lf-url"/>
+          </div>
+          <div class="sbe-form-row">
+            <label>Preisklasse (priceRange)</label>
+            <input type="text" id="sbe-lf-price" placeholder="€€€"/>
+          </div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>📞 Kontakt</h3></div>
+          <div class="sbe-form-row"><label>Telefon</label><input type="text" id="sbe-lf-tel"/></div>
+          <div class="sbe-form-row"><label>E-Mail</label><input type="email" id="sbe-lf-email"/></div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>📍 PostalAddress <span class="sbe-schema-badge" style="margin-left:6px">PostalAddress</span></h3></div>
+          <div class="sbe-form-row sbe-form-row--full"><label>Straße &amp; Hausnummer</label><input type="text" id="sbe-lf-street"/></div>
+          <div class="sbe-form-row"><label>Ort</label><input type="text" id="sbe-lf-city"/></div>
+          <div class="sbe-form-row"><label>PLZ</label><input type="text" id="sbe-lf-plz"/></div>
+          <div class="sbe-form-row"><label>Bundesland</label><input type="text" id="sbe-lf-region"/></div>
+          <div class="sbe-form-row"><label>Land</label><input type="text" id="sbe-lf-country" value="DE"/></div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>🌐 GeoCoordinates</h3></div>
+          <div class="sbe-form-row"><label>Breitengrad</label><input type="number" step="0.0000001" id="sbe-lf-lat"/></div>
+          <div class="sbe-form-row"><label>Längengrad</label><input type="number" step="0.0000001" id="sbe-lf-lng"/></div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>⭐ AggregateRating</h3></div>
+          <div class="sbe-form-row"><label>Bewertung</label><input type="number" step="0.1" min="0" max="5" id="sbe-lf-rating"/></div>
+          <div class="sbe-form-row"><label>Anzahl Bewertungen</label><input type="number" id="sbe-lf-reviews"/></div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>🖼️ Medien</h3></div>
+          <div class="sbe-form-row"><label>Bild-URL</label><input type="url" id="sbe-lf-image"/></div>
+          <div class="sbe-form-row"><label>Logo-URL</label><input type="url" id="sbe-lf-logo"/></div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>🔗 sameAs / hasMap</h3></div>
+          <div class="sbe-form-row sbe-form-row--full"><label>sameAs URLs (komma-getrennt)</label><input type="text" id="sbe-lf-sameas" placeholder="https://facebook.com/…"/></div>
+          <div class="sbe-form-row sbe-form-row--full"><label>Maps-URL</label><input type="url" id="sbe-lf-map"/></div>
+
+          <div class="sbe-form-section sbe-form-section--span">
+            <h3>🕐 OpeningHoursSpecification
+              <span class="sbe-schema-badge sbe-schema-badge--hours" style="margin-left:6px">OpeningHoursSpecification</span>
+            </h3>
+          </div>
+          <div class="sbe-form-row--full" id="sbe-hours-editor"></div>
+
+          <div class="sbe-form-section sbe-form-section--span"><h3>⚙️ Sonstiges</h3></div>
+          <div class="sbe-form-row"><label>Zahlung</label><input type="text" id="sbe-lf-payment" placeholder="Cash, Credit Card"/></div>
+          <div class="sbe-form-row"><label>Währungen</label><input type="text" id="sbe-lf-currencies" value="EUR"/></div>
+          <div class="sbe-form-row"><label>Barrierefrei</label><select id="sbe-lf-accessible"><option value="1">Ja</option><option value="0">Nein</option></select></div>
+          <div class="sbe-form-row"><label>Rauchen</label><select id="sbe-lf-smoking"><option value="0">Nein</option><option value="1">Ja</option></select></div>
+          <div class="sbe-form-row"><label>Status</label><select id="sbe-lf-status"><option value="active">Aktiv</option><option value="draft">Entwurf</option><option value="inactive">Inaktiv</option></select></div>
+        </div>
+        <div class="sbe-modal-footer">
+          <button class="button" onclick="sbeCloseModal('location')">Abbrechen</button>
+          <button class="button button-primary" onclick="sbeSaveLocationModal()">Standort speichern</button>
+        </div>
+      </div>
+    </div>
+    <?php
+}
+
+// ── Row renderers ─────────────────────────────────────────────────────────────
+
+function sbe_render_source_row(array $s): string {
+    $id      = (int)$s['id'];
+    $j       = esc_attr(json_encode($s));
+    $active  = (int)$s['is_active'];
+    $cls     = $active ? 'sbe-status--published' : 'sbe-status--draft';
+    $lbl     = $active ? 'Aktiv' : 'Inaktiv';
+    $scraped = $s['last_scraped'] ? date('d.m.Y H:i', strtotime($s['last_scraped'])) : '–';
+    $err     = !empty($s['last_error']) ? '<span class="sbe-source-error" title="' . esc_attr($s['last_error']) . '">⚠</span>' : '';
+    $evUrls  = !empty($s['events_url']) ? array_filter(array_map('trim', preg_split('/[\r\n]+/', $s['events_url']))) : [];
+    $evCount = count($evUrls);
+    $evLabel = $evCount > 0 ? '<small title="' . esc_attr(implode("\n", $evUrls)) . '">' . $evCount . ' URL' . ($evCount > 1 ? 's' : '') . '</small>' : '<small style="color:#aaa">–</small>';
+    return "<tr id=\"sbe-src-row-$id\" data-id=\"$id\">
+      <td class=\"sbe-col-name\"><strong>" . esc_html($s['name']) . "</strong></td>
+      <td><small>" . esc_html($s['base_url']) . "</small></td>
+      <td style=\"text-align:center\">$evLabel</td>
+      <td><span class=\"sbe-status $cls\">$lbl</span></td>
+      <td>$scraped $err</td>
+      <td style=\"text-align:center\">" . (int)($s['events_found'] ?? 0) . "</td>
+      <td>" . ($s['last_error'] ? '<span class="sbe-status sbe-status--scraped">Fehler</span>' : '<span class="sbe-status sbe-status--published">OK</span>') . "</td>
+      <td class=\"sbe-col-actions\">
+        <button class=\"button button-small sbe-btn-edit-source\" data-src=\"$j\">Bearbeiten</button>
+        <button class=\"button button-small sbe-btn-delete-source\" data-id=\"$id\" style=\"color:#d32f2f;border-color:#ef9a9a\">✕</button>
+      </td></tr>";
+}
+
+function sbe_render_event_row(array $ev): string {
+    $date = $ev['start_date'] ? date('d.m.Y H:i', strtotime($ev['start_date'])) : '–';
+    $cls  = ['scraped'=>'sbe-status--scraped','approved'=>'sbe-status--approved','published'=>'sbe-status--published','draft'=>'sbe-status--draft'][$ev['status']] ?? '';
+    $lbl  = ['scraped'=>'Gescrapt','approved'=>'Genehmigt','published'=>'Veröffentlicht','draft'=>'Entwurf'][$ev['status']] ?? $ev['status'];
+    $id   = (int)$ev['id'];
+    $j    = esc_attr(json_encode($ev));
+    $schema = sbe_calc_schema_completeness($ev);
+    $sPct  = $schema['pct'];
+    $sTip  = esc_attr($schema['tip']);
+    $sClr  = $sPct >= 80 ? '#2e7d32' : ($sPct >= 50 ? '#d46b00' : '#d32f2f');
+    return "<tr id=\"sbe-row-$id\" data-id=\"$id\">
+      <td><input type=\"checkbox\" class=\"sbe-row-check\" value=\"$id\"/></td>
+      <td class=\"sbe-col-name\"><strong>" . esc_html($ev['name']) . "</strong></td>
+      <td>$date</td>
+      <td>" . esc_html($ev['city']??'') . "</td>
+      <td>" . esc_html($ev['event_type']??'') . "</td>
+      <td class=\"sbe-col-source\">" . esc_html($ev['source']??'') . "</td>
+      <td><div class=\"sbe-schema-bar\" title=\"$sTip\"><div class=\"sbe-schema-fill\" style=\"width:{$sPct}%;background:$sClr\"></div><span class=\"sbe-schema-pct\">{$sPct}%</span></div></td>
+      <td><span class=\"sbe-status $cls\">$lbl</span></td>
+      <td class=\"sbe-col-actions\">
+        <button class=\"button button-small sbe-btn-edit-event\" data-ev=\"$j\">Bearbeiten</button>
+        <button class=\"button button-small sbe-btn-approve-row\" data-id=\"$id\">✓</button>
+        <button class=\"button button-small sbe-btn-delete-event\" data-id=\"$id\">✕</button>
+      </td></tr>";
+}
+
+/**
+ * Calculate schema.org/Event completeness percentage.
+ * Checks the most important fields for a valid Event schema.
+ */
+function sbe_calc_schema_completeness(array $ev): array {
+    $fields = [
+        'name'        => ['label' => 'Name',          'weight' => 2, 'filled' => !empty($ev['name'])],
+        'start_date'  => ['label' => 'startDate',     'weight' => 2, 'filled' => !empty($ev['start_date'])],
+        'description' => ['label' => 'description',   'weight' => 1, 'filled' => !empty($ev['description']) && strlen($ev['description']) > 10],
+        'location'    => ['label' => 'location',      'weight' => 1, 'filled' => !empty($ev['location'])],
+        'city'        => ['label' => 'addressLocality','weight' => 1, 'filled' => !empty($ev['city'])],
+        'address'     => ['label' => 'address',       'weight' => 1, 'filled' => !empty($ev['address'])],
+        'organizer'   => ['label' => 'organizer',     'weight' => 1, 'filled' => !empty($ev['organizer'])],
+        'url'         => ['label' => 'url',           'weight' => 1, 'filled' => !empty($ev['url'])],
+        'image_url'   => ['label' => 'image',         'weight' => 1, 'filled' => !empty($ev['image_url'])],
+        'end_date'    => ['label' => 'endDate',       'weight' => 1, 'filled' => !empty($ev['end_date'])],
+        'event_type'  => ['label' => 'eventType',     'weight' => 1, 'filled' => !empty($ev['event_type'])],
+        'ticket_url'  => ['label' => 'offers.url',    'weight' => 1, 'filled' => !empty($ev['ticket_url'])],
+        'price'       => ['label' => 'offers.price',  'weight' => 1, 'filled' => !empty($ev['price'])],
+    ];
+
+    $total_weight = 0;
+    $filled_weight = 0;
+    $missing = [];
+    $present = [];
+
+    foreach ($fields as $key => $f) {
+        $total_weight += $f['weight'];
+        if ($f['filled']) {
+            $filled_weight += $f['weight'];
+            $present[] = $f['label'];
+        } else {
+            $missing[] = $f['label'];
+        }
+    }
+
+    $pct = $total_weight > 0 ? (int)round(($filled_weight / $total_weight) * 100) : 0;
+    $tip = "Schema: {$pct}%\n✓ " . implode(', ', $present);
+    if (!empty($missing)) $tip .= "\n✗ " . implode(', ', $missing);
+
+    return ['pct' => $pct, 'tip' => $tip, 'missing' => $missing, 'present' => $present];
+}
+
+function sbe_render_location_row(array $loc): string {
+    $hours   = sbe_get_hours((int)$loc['id']);
+    $h_count = count($hours);
+    $id  = (int)$loc['id'];
+    $j   = esc_attr(json_encode($loc));
+    $cls = $loc['status']==='active' ? 'sbe-status--published' : 'sbe-status--draft';
+    return "<tr id=\"sbe-loc-row-$id\">
+      <td class=\"sbe-col-name\"><strong>" . esc_html($loc['name']) . "</strong><br><small>" . esc_html($loc['url']??'') . "</small></td>
+      <td>" . esc_html($loc['address_locality']??'') . "</td>
+      <td>" . esc_html($loc['postal_code']??'') . "</td>
+      <td>" . esc_html($loc['telephone']??'') . "</td>
+      <td>" . ($loc['rating_value'] ? '★ '.esc_html($loc['rating_value']) : '–') . "</td>
+      <td>" . esc_html($loc['price_range']??'–') . "</td>
+      <td><span class=\"sbe-hours-count\">$h_count Tage</span></td>
+      <td><span class=\"sbe-status $cls\">" . ($loc['status']==='active'?'Aktiv':'Entwurf') . "</span></td>
+      <td class=\"sbe-col-actions\">
+        <button class=\"button button-small sbe-btn-edit-location\" data-loc=\"$j\">Bearbeiten</button>
+        <button class=\"button button-small sbe-btn-delete-location\" data-id=\"$id\">✕</button>
+      </td></tr>";
+}
